@@ -37,18 +37,10 @@ export const getPublicJob = createServerFn({ method: "GET" })
       .select("id, title, department, location, employment_type, salary_min, salary_max, salary_currency, description, requirements, organization_id, organizations(company_name, slug, logo_url)")
       .eq("id", data.jobId).eq("status", "published").maybeSingle();
     if (!job) return null;
-    // Use service role key to bypass RLS — organization_settings is not readable by anon
-    const sbAdmin = createClient<Database>(
-      process.env.SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-      { realtime: { transport: ws }, auth: { storage: undefined, persistSession: false, autoRefreshToken: false } },
-    );
-    const { data: settings } = await sbAdmin
-      .from("organization_settings")
-      .select("form_config")
-      .eq("organization_id", job.organization_id)
-      .maybeSingle();
-    return { ...job, form_config: settings?.form_config ?? null };
+    // get_org_form_config is a SECURITY DEFINER function — readable by anon, no service role needed
+    const { data: formConfig } = await sb
+      .rpc("get_org_form_config", { org_id: job.organization_id });
+    return { ...job, form_config: formConfig ?? null };
   });
 
 // ─── Application submit server function ──────────────────────────────────────
