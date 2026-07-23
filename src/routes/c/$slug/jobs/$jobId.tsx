@@ -509,10 +509,10 @@ function JobPublic() {
             {job.department && <span className="inline-flex items-center gap-1"><Briefcase className="h-3.5 w-3.5" />{job.department}</span>}
             {job.location && <span className="inline-flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{job.location}</span>}
             <span className="capitalize">{job.employment_type.replaceAll("_", " ")}</span>
-            {(job.salary_min && job.salary_max || (job as unknown as { has_incentives?: boolean }).has_incentives) && (
+            {(job.salary_min && job.salary_max || job.has_incentives) && (
               <span className="inline-flex items-center gap-1.5">
                 {job.salary_min && job.salary_max && formatSalary(job.salary_min, job.salary_max)}
-                {(job as unknown as { has_incentives?: boolean }).has_incentives && (
+                {job.has_incentives && (
                   <span className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
                     + Incentives
                   </span>

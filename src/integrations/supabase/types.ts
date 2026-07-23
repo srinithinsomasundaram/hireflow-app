@@ -380,6 +380,7 @@ export type Database = {
           department: string | null
           description: string | null
           employment_type: Database["public"]["Enums"]["employment_type"]
+          has_incentives: boolean
           id: string
           location: string | null
           organization_id: string
@@ -398,6 +399,7 @@ export type Database = {
           department?: string | null
           description?: string | null
           employment_type?: Database["public"]["Enums"]["employment_type"]
+          has_incentives?: boolean
           id?: string
           location?: string | null
           organization_id: string
@@ -416,6 +418,7 @@ export type Database = {
           department?: string | null
           description?: string | null
           employment_type?: Database["public"]["Enums"]["employment_type"]
+          has_incentives?: boolean
           id?: string
           location?: string | null
           organization_id?: string
