@@ -97,62 +97,55 @@ export const submitApplicationFn = createServerFn({ method: "POST" })
       if (!isValidPath) return { error: "Invalid resume URL." };
     }
 
-    const sb = createClient<Database>(
+    // Use anon/publishable key for the core submission path — the
+    // submit_job_application() function is SECURITY DEFINER so it handles
+    // candidate upsert and application insert without needing service role.
+    const sbAnon = createClient<Database>(
       process.env.SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      process.env.SUPABASE_PUBLISHABLE_KEY!,
       { realtime: { transport: ws }, auth: { storage: undefined, persistSession: false, autoRefreshToken: false } },
     );
 
-    // Upsert candidate — if same email already applied to this org, reuse the record.
-    const { data: existing } = await sb
-      .from("candidates")
-      .select("id")
-      .eq("organization_id", data.organizationId)
-      .eq("email", data.email)
-      .maybeSingle();
+    const { data: submitResult, error: rpcErr } = await sbAnon.rpc("submit_job_application", {
+      p_organization_id:  data.organizationId,
+      p_job_id:           data.jobId,
+      p_full_name:        data.full_name,
+      p_email:            data.email,
+      p_phone:            data.phone ?? null,
+      p_linkedin_url:     data.linkedin_url ?? null,
+      p_current_company:  data.current_company ?? null,
+      p_experience_years: data.experience_years ?? null,
+      p_expected_salary:  data.expected_salary ?? null,
+      p_notice_period:    data.notice_period ?? null,
+      p_resume_url:       data.resume_url ?? null,
+      p_cover_letter:     data.cover_letter ?? null,
+    });
 
-    let candidateId: string;
-    if (existing) {
-      candidateId = existing.id;
-    } else {
-      const { data: cand, error: candErr } = await sb.from("candidates").insert({
-        organization_id: data.organizationId,
-        full_name: data.full_name,
-        email: data.email,
-        phone: data.phone || null,
-        linkedin_url: data.linkedin_url || null,
-        current_company: data.current_company || null,
-        experience_years: data.experience_years ?? null,
-        expected_salary: data.expected_salary ?? null,
-        notice_period: data.notice_period || null,
-        resume_url: data.resume_url ?? null,
-        source: "careers_site",
-      }).select("id").single();
-      if (candErr) return { error: "Failed to save your details. Please try again." };
-      candidateId = cand.id;
+    if (rpcErr) {
+      console.error("[submitApplication] rpc error:", rpcErr);
+      return { error: "Failed to submit application. Please try again." };
     }
 
-    // Prevent duplicate applications to the same job.
-    const { data: dupApp } = await sb
-      .from("applications")
-      .select("id")
-      .eq("job_id", data.jobId)
-      .eq("candidate_id", candidateId)
-      .maybeSingle();
-    if (dupApp) return { error: "You have already applied for this position." };
+    const result = submitResult as { error?: string; application_id?: string; candidate_id?: string };
+    if (result.error) return { error: result.error };
 
-    const { data: app, error: appErr } = await sb.from("applications").insert({
-      organization_id: data.organizationId,
-      job_id: data.jobId,
-      candidate_id: candidateId,
-      cover_letter: data.cover_letter || null,
-      source: "careers_site",
-    }).select("id").single();
+    const applicationId = result.application_id!;
+    const candidateId   = result.candidate_id!;
+    const app           = { id: applicationId };
 
-    if (appErr) return { error: "Failed to submit application. Please try again." };
+    // Service role client — used only for after-effects (scoring, notifications).
+    // If SUPABASE_SERVICE_ROLE_KEY is missing these steps fail gracefully;
+    // the application is already saved above.
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const sb = serviceKey
+      ? createClient<Database>(process.env.SUPABASE_URL!, serviceKey, {
+          realtime: { transport: ws },
+          auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
+        })
+      : null;
 
     // Auto-score in the background — fire and forget, never blocks the response
-    scoreApplicationCore(sb, app.id).catch(() => {});
+    if (sb) scoreApplicationCore(sb, app.id).catch(() => {});
 
     // Fire application_received automations (thank-you emails etc.)
     await runAutomations("application_received", {
@@ -163,11 +156,9 @@ export const submitApplicationFn = createServerFn({ method: "POST" })
     }).catch(e => console.error("[submitApplication] automations error:", e));
 
     // Fetch org integration settings (webhook + sheets)
-    const { data: settings } = await sb
-      .from("organization_settings")
-      .select("crm_config")
-      .eq("organization_id", data.organizationId)
-      .maybeSingle();
+    const { data: settings } = sb
+      ? await sb.from("organization_settings").select("crm_config").eq("organization_id", data.organizationId).maybeSingle()
+      : { data: null };
 
     const integrations = (settings?.crm_config as IntegrationConfig | null) ?? {};
 
@@ -230,7 +221,10 @@ export const submitApplicationFn = createServerFn({ method: "POST" })
     }
 
     // Notify all org admins & recruiters using their registered auth email
+    // (requires service role — skipped gracefully if key is not configured)
     try {
+      if (!sb) throw new Error("service role key not configured");
+
       const { data: orgData } = await sb
         .from("organizations")
         .select("company_name")
