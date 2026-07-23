@@ -34,7 +34,7 @@ export const getPublicJob = createServerFn({ method: "GET" })
     );
     const { data: job } = await sb
       .from("jobs")
-      .select("id, title, department, location, employment_type, salary_min, salary_max, salary_currency, description, requirements, organization_id, organizations(company_name, slug, logo_url)")
+      .select("id, title, department, location, employment_type, salary_min, salary_max, salary_currency, has_incentives, description, requirements, organization_id, organizations(company_name, slug, logo_url)")
       .eq("id", data.jobId).eq("status", "published").maybeSingle();
     if (!job) return null;
     // get_org_form_config is a SECURITY DEFINER function — readable by anon, no service role needed
@@ -577,7 +577,16 @@ function JobPublic() {
             {job.department && <span className="inline-flex items-center gap-1"><Briefcase className="h-3.5 w-3.5" />{job.department}</span>}
             {job.location && <span className="inline-flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{job.location}</span>}
             <span className="capitalize">{job.employment_type.replaceAll("_", " ")}</span>
-            {job.salary_min && job.salary_max && <span>{formatSalary(job.salary_min, job.salary_max)}</span>}
+            {job.salary_min && job.salary_max && (
+                <span>
+                  {formatSalary(job.salary_min, job.salary_max)}
+                  {(job as unknown as { has_incentives?: boolean }).has_incentives && (
+                    <span className="ml-1.5 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
+                      + Incentives
+                    </span>
+                  )}
+                </span>
+              )}
           </div>
         </div>
 

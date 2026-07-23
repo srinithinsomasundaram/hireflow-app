@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { generateJobFromPrompt } from "@/lib/ai.functions";
 
 export const Route = createFileRoute("/_authenticated/jobs/new")({
@@ -24,6 +25,7 @@ const DEFAULT_FORM = {
   title: "", department: "", location: "",
   employment_type: "full_time" as EmploymentType,
   salary_min: "", salary_max: "",
+  has_incentives: false,
   description: "", requirements: "",
 };
 
@@ -165,6 +167,7 @@ function NewJob() {
         salary_min: form.salary_min ? parseInt(form.salary_min, 10) : null,
         salary_max: form.salary_max ? parseInt(form.salary_max, 10) : null,
         salary_currency: "INR",
+        has_incentives: form.has_incentives,
         description: form.description || null,
         requirements: form.requirements || null,
         status: publish ? "published" : "draft",
@@ -254,7 +257,7 @@ function NewJob() {
               <CardTitle className="text-sm font-semibold">Compensation</CardTitle>
               <p className="text-xs text-muted-foreground mt-0.5">Annual salary range in Indian Rupees (optional)</p>
             </CardHeader>
-            <CardContent className="pt-4">
+            <CardContent className="pt-4 space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
                   <Label htmlFor="smin">Minimum (₹)</Label>
@@ -266,6 +269,21 @@ function NewJob() {
                   <Input id="smax" type="number" className="mt-1.5" value={form.salary_max}
                     onChange={e => setForm({ ...form, salary_max: e.target.value })} placeholder="1,800,000" />
                 </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="incentives"
+                  checked={form.has_incentives}
+                  onCheckedChange={v => setForm({ ...form, has_incentives: !!v })}
+                />
+                <label htmlFor="incentives" className="text-sm text-muted-foreground cursor-pointer select-none">
+                  + Incentives
+                  {form.has_incentives && (
+                    <span className="ml-2 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
+                      + Incentives
+                    </span>
+                  )}
+                </label>
               </div>
             </CardContent>
           </Card>
