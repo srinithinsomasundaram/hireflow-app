@@ -15,10 +15,10 @@ const STATIC_SECURITY_HEADERS: Record<string, string> = {
 };
 
 const CSP = [
-  "script-src 'self' 'unsafe-inline' https://cal.id",
+  "script-src 'self' 'unsafe-inline' https://cal.id https://static.cloudflareinsights.com",
   "style-src 'self' 'unsafe-inline' https://cal.id",
   "img-src 'self' data: blob: https:",
-  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.openai.com https://cal.id",
+  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.openai.com https://cal.id https://cloudflareinsights.com",
   "frame-src 'self' https://cal.id",
   "font-src 'self' data:",
   "worker-src blob:",
@@ -153,6 +153,12 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
 
 async function handleRequest(request: Request, env: unknown, ctx: unknown): Promise<Response> {
   try {
+    // Redirect legacy favicon.ico requests to our SVG favicon
+    const url = new URL(request.url);
+    if (url.pathname === "/favicon.ico") {
+      return Response.redirect(`${url.protocol}//${url.host}/favicon.svg`, 301);
+    }
+
     const subdomainRedirect = redirectToSubdomain(request);
     if (subdomainRedirect) return applySecurityHeaders(subdomainRedirect);
 

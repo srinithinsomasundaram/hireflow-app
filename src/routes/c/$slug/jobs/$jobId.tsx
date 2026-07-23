@@ -144,216 +144,154 @@ export const submitApplicationFn = createServerFn({ method: "POST" })
         })
       : null;
 
-    // Auto-score in the background — fire and forget, never blocks the response
-    if (sb) scoreApplicationCore(sb, app.id).catch(() => {});
+    // Return immediately — all side effects run in the background.
+    // Candidate sees the success screen without waiting for emails/webhooks/scoring.
+    void (async () => {
+      // AI scoring (fire-and-forget within background)
+      if (sb) scoreApplicationCore(sb, app.id).catch(() => {});
 
-    // Fire application_received automations (thank-you emails etc.)
-    await runAutomations("application_received", {
-      applicationId: app.id,
-      candidateId,
-      jobId: data.jobId,
-      organizationId: data.organizationId,
-    }).catch(e => console.error("[submitApplication] automations error:", e));
+      // Automations (thank-you emails to candidate, stage moves, etc.)
+      await runAutomations("application_received", {
+        applicationId: app.id,
+        candidateId,
+        jobId: data.jobId,
+        organizationId: data.organizationId,
+      }).catch(e => console.error("[submitApplication] automations:", e));
 
-    // Fetch org integration settings (webhook + sheets)
-    const { data: settings } = sb
-      ? await sb.from("organization_settings").select("crm_config").eq("organization_id", data.organizationId).maybeSingle()
-      : { data: null };
+      if (!sb) return;
 
-    const integrations = (settings?.crm_config as IntegrationConfig | null) ?? {};
-
-    const payload = JSON.stringify({
-      event: "application.submitted",
-      timestamp: new Date().toISOString(),
-      data: {
-        application_id: app.id,
-        candidate_id: candidateId,
-        job_id: data.jobId,
-        organization_id: data.organizationId,
-        candidate: {
-          full_name: data.full_name,
-          email: data.email,
-          phone: data.phone,
-          linkedin_url: data.linkedin_url,
-          current_company: data.current_company,
-          experience_years: data.experience_years,
-          expected_salary: data.expected_salary,
-          notice_period: data.notice_period,
-        },
-        job: {
-          title: data.jobTitle,
-          department: data.jobDepartment,
-        },
-      },
-    });
-
-    // Fire custom webhook with HMAC-SHA256 signature
-    if (integrations.webhook?.enabled && integrations.webhook.url) {
-      try {
-        if (isSafeOutboundUrl(integrations.webhook.url)) {
-          const ts = Date.now().toString();
-          const whHeaders: Record<string, string> = {
-            "Content-Type": "application/json",
-            "X-HireFlow-Timestamp": ts,
-          };
-          if (integrations.webhook.secret) {
-            const sig = createHmac("sha256", integrations.webhook.secret)
-              .update(`${ts}.${payload}`)
-              .digest("hex");
-            whHeaders["X-HireFlow-Signature-256"] = `sha256=${sig}`;
-          }
-          await fetch(integrations.webhook.url, { method: "POST", headers: whHeaders, body: payload });
-        }
-      } catch {}
-    }
-
-    // Fire Google Sheets Apps Script
-    if (integrations.sheets?.enabled && integrations.sheets.script_url) {
-      try {
-        if (isSafeOutboundUrl(integrations.sheets.script_url)) {
-          await fetch(integrations.sheets.script_url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-          });
-        }
-      } catch {}
-    }
-
-    // Notify all org admins & recruiters using their registered auth email
-    // (requires service role — skipped gracefully if key is not configured)
-    try {
-      if (!sb) throw new Error("service role key not configured");
-
-      const { data: orgData } = await sb
-        .from("organizations")
-        .select("company_name")
-        .eq("id", data.organizationId)
+      // Org integration settings (webhook + sheets)
+      const { data: settings } = await sb
+        .from("organization_settings")
+        .select("crm_config")
+        .eq("organization_id", data.organizationId)
         .maybeSingle();
 
-      const { data: members } = await sb
-        .from("user_roles")
-        .select("user_id")
-        .eq("organization_id", data.organizationId)
-        .in("role", ["owner", "admin", "recruiter"]);
+      const integrations = (settings?.crm_config as IntegrationConfig | null) ?? {};
 
-      const uniqueUserIds = [...new Set((members ?? []).map(m => m.user_id))];
+      const payload = JSON.stringify({
+        event: "application.submitted",
+        timestamp: new Date().toISOString(),
+        data: {
+          application_id: app.id,
+          candidate_id: candidateId,
+          job_id: data.jobId,
+          organization_id: data.organizationId,
+          candidate: {
+            full_name: data.full_name,
+            email: data.email,
+            phone: data.phone,
+            linkedin_url: data.linkedin_url,
+            current_company: data.current_company,
+            experience_years: data.experience_years,
+            expected_salary: data.expected_salary,
+            notice_period: data.notice_period,
+          },
+          job: { title: data.jobTitle, department: data.jobDepartment },
+        },
+      });
 
-      // Use auth.admin to get the real registered email — profiles.email can be null
-      const authEmails = (
-        await Promise.all(
-          uniqueUserIds.map(uid => sb.auth.admin.getUserById(uid))
-        )
-      )
-        .map(r => r.data.user?.email)
-        .filter(Boolean) as string[];
-
-      if (authEmails.length > 0) {
-        // Generate signed resume URL (valid 7 days) if resume exists
-        let resumeLink = "Not provided";
-        if (data.resume_url) {
-          const { data: signed } = await sb.storage
-            .from("resumes")
-            .createSignedUrl(data.resume_url, 60 * 60 * 24 * 7);
-          if (signed?.signedUrl) resumeLink = signed.signedUrl;
-        }
-
-        const appliedOn = new Date().toLocaleString("en-IN", {
-          timeZone: "Asia/Kolkata",
-          day: "2-digit", month: "short", year: "numeric",
-          hour: "2-digit", minute: "2-digit", hour12: true,
-        });
-
-        const dashboardUrl = process.env.APP_URL
-          ? `${process.env.APP_URL}/pipeline`
-          : "https://hireflow.yespstudio.com/pipeline";
-
-        const html = `
-          <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;">
-
-            <!-- Header -->
-            <div style="background:#0f172a;padding:24px 32px;display:flex;align-items:center;gap:10px;">
-              <span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:-.4px;">HireFlow</span>
-              <span style="color:#64748b;font-size:13px;margin-left:4px;">by YESP</span>
-            </div>
-
-            <!-- Body -->
-            <div style="padding:36px 32px;">
-              <p style="margin:0 0 6px;font-size:14px;color:#64748b;">Hiring Team Notification</p>
-              <h1 style="margin:0 0 24px;font-size:22px;font-weight:700;color:#0f172a;">New Job Application Received</h1>
-
-              <p style="margin:0 0 28px;font-size:15px;color:#374151;line-height:1.6;">
-                Hello,<br><br>
-                A new application has been submitted through HireFlow.
-              </p>
-
-              <!-- Candidate Details -->
-              <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:24px;margin-bottom:28px;">
-                <p style="margin:0 0 16px;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;">Candidate Details</p>
-
-                <table style="width:100%;border-collapse:collapse;">
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;width:130px;vertical-align:top;font-weight:500;">Name</td>
-                    <td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${data.full_name}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Email</td>
-                    <td style="padding:8px 0;font-size:14px;"><a href="mailto:${data.email}" style="color:#2563eb;text-decoration:none;">${data.email}</a></td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Phone</td>
-                    <td style="padding:8px 0;color:#0f172a;font-size:14px;">${data.phone || "Not provided"}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Position</td>
-                    <td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${data.jobTitle}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Experience</td>
-                    <td style="padding:8px 0;color:#0f172a;font-size:14px;">${data.experience_years != null ? `${data.experience_years} year${data.experience_years !== 1 ? "s" : ""}` : "Not provided"}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Resume</td>
-                    <td style="padding:8px 0;font-size:14px;">${resumeLink !== "Not provided" ? `<a href="${resumeLink}" style="color:#2563eb;text-decoration:none;">View Resume →</a>` : "Not provided"}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px 0;color:#64748b;font-size:14px;vertical-align:top;font-weight:500;">Applied On</td>
-                    <td style="padding:8px 0;color:#0f172a;font-size:14px;">${appliedOn} IST</td>
-                  </tr>
-                </table>
-              </div>
-
-              <!-- CTA -->
-              <div style="text-align:center;margin-bottom:32px;">
-                <a href="${dashboardUrl}" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:13px 28px;border-radius:8px;letter-spacing:-.1px;">View Application →</a>
-              </div>
-
-              <!-- Footer -->
-              <div style="border-top:1px solid #f1f5f9;padding-top:20px;">
-                <p style="margin:0;font-size:13px;color:#94a3b8;line-height:1.6;">
-                  Regards,<br>
-                  <strong style="color:#64748b;">HireFlow by YESP</strong>
-                </p>
-              </div>
-            </div>
-          </div>
-        `;
-
-        await Promise.allSettled(
-          authEmails.map(email =>
-            sendSystemEmail(
-              email,
-              `New Job Application Received – ${data.full_name}`,
-              html,
-            )
-          )
-        );
-
-        console.log(`[submitApplication] notified ${authEmails.length} member(s):`, authEmails);
+      // Custom webhook
+      if (integrations.webhook?.enabled && integrations.webhook.url) {
+        try {
+          if (isSafeOutboundUrl(integrations.webhook.url)) {
+            const ts = Date.now().toString();
+            const whHeaders: Record<string, string> = {
+              "Content-Type": "application/json",
+              "X-HireFlow-Timestamp": ts,
+            };
+            if (integrations.webhook.secret) {
+              const sig = createHmac("sha256", integrations.webhook.secret)
+                .update(`${ts}.${payload}`).digest("hex");
+              whHeaders["X-HireFlow-Signature-256"] = `sha256=${sig}`;
+            }
+            await fetch(integrations.webhook.url, { method: "POST", headers: whHeaders, body: payload });
+          }
+        } catch {}
       }
-    } catch (e) {
-      console.error("[submitApplication] team notification failed:", e);
-    }
+
+      // Google Sheets Apps Script
+      if (integrations.sheets?.enabled && integrations.sheets.script_url) {
+        try {
+          if (isSafeOutboundUrl(integrations.sheets.script_url)) {
+            await fetch(integrations.sheets.script_url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: payload,
+            });
+          }
+        } catch {}
+      }
+
+      // Team notification email
+      try {
+        const [{ data: orgData }, { data: members }] = await Promise.all([
+          sb.from("organizations").select("company_name").eq("id", data.organizationId).maybeSingle(),
+          sb.from("user_roles").select("user_id").eq("organization_id", data.organizationId).in("role", ["owner", "admin", "recruiter"]),
+        ]);
+
+        const uniqueUserIds = [...new Set((members ?? []).map(m => m.user_id))];
+        const authEmails = (
+          await Promise.all(uniqueUserIds.map(uid => sb.auth.admin.getUserById(uid)))
+        ).map(r => r.data.user?.email).filter(Boolean) as string[];
+
+        if (authEmails.length > 0) {
+          let resumeLink = "Not provided";
+          if (data.resume_url) {
+            const { data: signed } = await sb.storage.from("resumes").createSignedUrl(data.resume_url, 60 * 60 * 24 * 7);
+            if (signed?.signedUrl) resumeLink = signed.signedUrl;
+          }
+
+          const appliedOn = new Date().toLocaleString("en-IN", {
+            timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric",
+            hour: "2-digit", minute: "2-digit", hour12: true,
+          });
+
+          const dashboardUrl = process.env.APP_URL
+            ? `${process.env.APP_URL}/pipeline`
+            : "https://hireflow.yespstudio.com/pipeline";
+
+          const html = `
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;">
+              <div style="background:#0f172a;padding:24px 32px;display:flex;align-items:center;gap:10px;">
+                <span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:-.4px;">HireFlow</span>
+                <span style="color:#64748b;font-size:13px;margin-left:4px;">by YESP</span>
+              </div>
+              <div style="padding:36px 32px;">
+                <p style="margin:0 0 6px;font-size:14px;color:#64748b;">Hiring Team Notification</p>
+                <h1 style="margin:0 0 24px;font-size:22px;font-weight:700;color:#0f172a;">New Job Application Received</h1>
+                <p style="margin:0 0 28px;font-size:15px;color:#374151;line-height:1.6;">Hello,<br><br>A new application has been submitted through HireFlow.</p>
+                <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:24px;margin-bottom:28px;">
+                  <p style="margin:0 0 16px;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;">Candidate Details</p>
+                  <table style="width:100%;border-collapse:collapse;">
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;width:130px;font-weight:500;">Name</td><td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${data.full_name}</td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Email</td><td style="padding:8px 0;font-size:14px;"><a href="mailto:${data.email}" style="color:#2563eb;text-decoration:none;">${data.email}</a></td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Phone</td><td style="padding:8px 0;color:#0f172a;font-size:14px;">${data.phone || "Not provided"}</td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Position</td><td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${data.jobTitle}</td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Experience</td><td style="padding:8px 0;color:#0f172a;font-size:14px;">${data.experience_years != null ? `${data.experience_years} year${data.experience_years !== 1 ? "s" : ""}` : "Not provided"}</td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Resume</td><td style="padding:8px 0;font-size:14px;">${resumeLink !== "Not provided" ? `<a href="${resumeLink}" style="color:#2563eb;text-decoration:none;">View Resume →</a>` : "Not provided"}</td></tr>
+                    <tr><td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:500;">Applied On</td><td style="padding:8px 0;color:#0f172a;font-size:14px;">${appliedOn} IST</td></tr>
+                  </table>
+                </div>
+                <div style="text-align:center;margin-bottom:32px;">
+                  <a href="${dashboardUrl}" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:13px 28px;border-radius:8px;">View Application →</a>
+                </div>
+                <div style="border-top:1px solid #f1f5f9;padding-top:20px;">
+                  <p style="margin:0;font-size:13px;color:#94a3b8;line-height:1.6;">Regards,<br><strong style="color:#64748b;">HireFlow by YESP</strong></p>
+                </div>
+              </div>
+            </div>
+          `;
+
+          await Promise.allSettled(
+            authEmails.map(email => sendSystemEmail(email, `New Job Application Received – ${data.full_name}`, html))
+          );
+          console.log(`[submitApplication] notified ${authEmails.length} member(s):`, authEmails);
+        }
+      } catch (e) {
+        console.error("[submitApplication] team notification failed:", e);
+      }
+    })();
 
     return {};
   });
@@ -571,12 +509,14 @@ function JobPublic() {
             {job.department && <span className="inline-flex items-center gap-1"><Briefcase className="h-3.5 w-3.5" />{job.department}</span>}
             {job.location && <span className="inline-flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{job.location}</span>}
             <span className="capitalize">{job.employment_type.replaceAll("_", " ")}</span>
-            {job.salary_min && job.salary_max && (
-              <span>{formatSalary(job.salary_min, job.salary_max)}</span>
-            )}
-            {(job as unknown as { has_incentives?: boolean }).has_incentives && (
-              <span className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
-                + Incentives
+            {(job.salary_min && job.salary_max || (job as unknown as { has_incentives?: boolean }).has_incentives) && (
+              <span className="inline-flex items-center gap-1.5">
+                {job.salary_min && job.salary_max && formatSalary(job.salary_min, job.salary_max)}
+                {(job as unknown as { has_incentives?: boolean }).has_incentives && (
+                  <span className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
+                    + Incentives
+                  </span>
+                )}
               </span>
             )}
           </div>

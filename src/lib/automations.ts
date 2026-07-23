@@ -46,9 +46,15 @@ function wrapEmail(body: string, workspaceName: string): string {
 }
 
 export async function runAutomations(trigger: string, ctx: AutomationContext) {
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!serviceKey) {
+    console.warn("[automations] SUPABASE_SERVICE_ROLE_KEY not set — skipping automations");
+    return;
+  }
+
   const sb = createClient<Database>(
     process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    serviceKey,
     { realtime: { transport: ws }, auth: { persistSession: false, autoRefreshToken: false } },
   );
 

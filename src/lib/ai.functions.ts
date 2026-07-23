@@ -190,17 +190,21 @@ export async function scoreApplicationCore(sb: any, applicationId: string, force
     .select("id, cover_letter, ai_score, ai_summary, candidates(full_name, current_company, experience_years), jobs(title, description, requirements)")
     .eq("id", applicationId)
     .single();
-  if (error || !app) return { score: 0, summary: "" };
+  if (error || !app) throw new Error("Application not found — cannot score.");
 
   if (!force && app.ai_score != null) {
     return { score: app.ai_score as number, summary: (app.ai_summary as string) ?? "" };
   }
 
-  let key: string;
-  try { key = getKey(); } catch { return { score: 0, summary: "" }; }
+  // Let this throw — caller decides whether to surface or suppress the error
+  const key = getKey();
 
-  const candidate = (app as unknown as { candidates: { full_name: string; current_company: string | null; experience_years: number | null } }).candidates;
-  const job = (app as unknown as { jobs: { title: string; description: string | null; requirements: string | null } }).jobs;
+  const rawCand = (app as unknown as { candidates: unknown }).candidates;
+  const rawJob  = (app as unknown as { jobs: unknown }).jobs;
+  const candidate = (Array.isArray(rawCand) ? rawCand[0] : rawCand) as { full_name: string; current_company: string | null; experience_years: number | null } | null;
+  const job       = (Array.isArray(rawJob)  ? rawJob[0]  : rawJob)  as { title: string; description: string | null; requirements: string | null } | null;
+
+  if (!candidate || !job) throw new Error("Application data incomplete — cannot score.");
 
   const res = await openaiRequest(key, {
     temperature: 0,
@@ -218,13 +222,16 @@ export async function scoreApplicationCore(sb: any, applicationId: string, force
     ],
   });
 
-  if (!res.ok) return { score: 0, summary: "" };
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`OpenAI error ${res.status}: ${txt.slice(0, 200)}`);
+  }
 
   const json = await res.json();
   let parsed: { score?: number; summary?: string } = {};
   try { parsed = JSON.parse(json.choices?.[0]?.message?.content ?? "{}"); } catch { /* ignore */ }
   const score = Math.max(0, Math.min(100, Math.round(parsed.score ?? 0)));
-  const summary = parsed.summary ?? "";
+  const summary = (parsed.summary ?? "").trim();
 
   await sb.from("applications").update({ ai_score: score, ai_summary: summary }).eq("id", applicationId);
 
