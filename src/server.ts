@@ -14,54 +14,24 @@ const STATIC_SECURITY_HEADERS: Record<string, string> = {
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 };
 
-function generateNonce(): string {
-  const buf = new Uint8Array(16);
-  crypto.getRandomValues(buf);
-  return btoa(String.fromCharCode(...buf))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=/g, "");
-}
+const CSP = [
+  "script-src 'self' 'unsafe-inline' https://cal.id",
+  "style-src 'self' 'unsafe-inline' https://cal.id",
+  "img-src 'self' data: blob: https:",
+  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.openai.com https://cal.id",
+  "frame-src 'self' https://cal.id",
+  "font-src 'self' data:",
+  "worker-src blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "frame-ancestors 'self'",
+].join("; ");
 
-function buildCsp(nonce: string): string {
-  return [
-    `script-src 'self' 'nonce-${nonce}' https://cal.id`,
-    "style-src 'self' 'unsafe-inline' https://cal.id",
-    "img-src 'self' data: blob: https:",
-    "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.openai.com https://cal.id",
-    "frame-src 'self' https://cal.id",
-    "font-src 'self' data:",
-    "worker-src blob:",
-    "object-src 'none'",
-    "base-uri 'self'",
-    "frame-ancestors 'self'",
-  ].join("; ");
-}
-
-async function applySecurityHeaders(response: Response, nonce: string): Promise<Response> {
+function applySecurityHeaders(response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [k, v] of Object.entries(STATIC_SECURITY_HEADERS)) headers.set(k, v);
-  headers.set("Content-Security-Policy", buildCsp(nonce));
-
-  const ct = headers.get("content-type") ?? "";
-  if (!ct.includes("text/html")) {
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
-  }
-
-  const text = await response.text();
-  const patched = text.replace(
-    /<script\b([^>]*)>/gi,
-    (_: string, attrs: string) => {
-      if (/\bnonce\s*=/.test(attrs)) return `<script${attrs}>`;
-      return `<script${attrs} nonce="${nonce}">`;
-    },
-  );
-
-  return new Response(patched, {
+  headers.set("Content-Security-Policy", CSP);
+  return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
@@ -182,23 +152,21 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
 // ─── Core handler ─────────────────────────────────────────────────────────────
 
 async function handleRequest(request: Request, env: unknown, ctx: unknown): Promise<Response> {
-  const nonce = generateNonce();
-
   try {
     const subdomainRedirect = redirectToSubdomain(request);
-    if (subdomainRedirect) return applySecurityHeaders(subdomainRedirect, nonce);
+    if (subdomainRedirect) return applySecurityHeaders(subdomainRedirect);
 
     const stripRedirect = stripRedundantSubdomainPath(request);
-    if (stripRedirect) return applySecurityHeaders(stripRedirect, nonce);
+    if (stripRedirect) return applySecurityHeaders(stripRedirect);
 
     const scopeRedirect = enforceSubdomainScope(request);
-    if (scopeRedirect) return applySecurityHeaders(scopeRedirect, nonce);
+    if (scopeRedirect) return applySecurityHeaders(scopeRedirect);
 
     const handler = await getServerEntry();
     const rewritten = rewriteForSubdomain(request);
     const response = await handler.fetch(rewritten, env, ctx);
     const normalized = await normalizeCatastrophicSsrResponse(response);
-    return applySecurityHeaders(normalized, nonce);
+    return applySecurityHeaders(normalized);
   } catch (error) {
     console.error("[server]", error);
     return applySecurityHeaders(
@@ -206,7 +174,6 @@ async function handleRequest(request: Request, env: unknown, ctx: unknown): Prom
         status: 500,
         headers: { "content-type": "text/html; charset=utf-8" },
       }),
-      nonce,
     );
   }
 }
