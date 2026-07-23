@@ -77,7 +77,7 @@ export async function runAutomations(trigger: string, ctx: AutomationContext) {
 
   console.log(`[automations] running ${automations.length} automation(s) for trigger=${trigger}`);
 
-  // Load context data
+  // Load all context data in parallel
   const [{ data: candidate }, { data: job }, { data: org }, { data: settings }] = await Promise.all([
     sb.from("candidates").select("full_name, email, tags").eq("id", ctx.candidateId).maybeSingle(),
     sb.from("jobs").select("title, department").eq("id", ctx.jobId).maybeSingle(),
@@ -85,47 +85,105 @@ export async function runAutomations(trigger: string, ctx: AutomationContext) {
     sb.from("organization_settings").select("smtp_config, smtp_enabled").eq("organization_id", ctx.organizationId).maybeSingle(),
   ]);
 
-  // Org-level SMTP — decrypt before use; password is stored AES-256-GCM encrypted
+  // Org-level SMTP for candidate emails (configured in Settings → Integrations)
   const orgSmtp = settings?.smtp_enabled && settings?.smtp_config
     ? decryptSmtpConfig(settings.smtp_config as Record<string, unknown>)
     : null;
 
   const vars: Record<string, string> = {
     candidate_name: candidate?.full_name ?? "Candidate",
-    job_title: job?.title ?? "the role",
-    company_name: org?.company_name ?? "the company",
+    job_title:      job?.title ?? "the role",
+    company_name:   org?.company_name ?? "the company",
   };
 
-  // Candidate emails use the org's own SMTP (set up by the hiring user in Settings → Integrations)
+  // Send email to candidate.
+  // Primary: org's own SMTP (personalized domain/sender).
+  // Fallback: system email (Resend / platform SMTP) so emails always go through
+  // even before the org configures their own SMTP.
   async function sendToCandidate(subject: string, body: string) {
     if (!candidate?.email) {
-      console.warn("[automations] candidate has no email, skipping send_email");
+      console.warn("[automations] candidate has no email — skipping send_email");
       return;
     }
-    if (!orgSmtp) {
-      console.warn("[automations] org has no SMTP configured — skipping candidate email. Set up SMTP in Settings → Integrations.");
-      return;
+    const html = wrapEmail(body, org?.company_name ?? "HireFlow");
+    if (orgSmtp) {
+      console.log(`[automations] sending via org SMTP to ${candidate.email} — ${subject}`);
+      await sendSmtpEmail(orgSmtp, candidate.email, subject, html);
+    } else {
+      console.log(`[automations] org SMTP not configured — sending via system email to ${candidate.email}`);
+      await sendSystemEmail(candidate.email, subject, html);
     }
-    const html = wrapEmail(body, org?.company_name ?? "");
-    console.log(`[automations] sending email to candidate ${candidate.email} — subject: ${subject}`);
-    await sendSmtpEmail(orgSmtp, candidate.email, subject, html);
   }
 
+  // Notify all org admins & recruiters (not just the owner).
+  // Always appends a candidate details card so the team knows who triggered the automation.
   async function notifyTeam(message: string) {
-    if (!org?.owner_id) return;
-    const { data: user } = await sb.auth.admin.getUserById(org.owner_id);
-    const email = user.user?.email;
-    if (!email) return;
-    const workspaceName = org?.company_name ?? "Notification";
-    const html = wrapEmail(message, workspaceName);
-    await sendSystemEmail(email, `${workspaceName}: ${message.slice(0, 80)}`, html);
+    const dashboardUrl = process.env.APP_URL
+      ? `${process.env.APP_URL}/pipeline`
+      : "https://hireflow.yespstudio.com/pipeline";
+
+    const candidateCard = candidate ? `
+      <div style="margin-top:24px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;">
+        <p style="margin:0 0 12px;font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;">Candidate</p>
+        <table style="width:100%;border-collapse:collapse;">
+          <tr><td style="padding:5px 0;color:#64748b;font-size:13px;width:110px;font-weight:500;">Name</td><td style="padding:5px 0;color:#0f172a;font-size:13px;font-weight:600;">${escapeHtml(candidate.full_name ?? "")}</td></tr>
+          ${candidate.email ? `<tr><td style="padding:5px 0;color:#64748b;font-size:13px;font-weight:500;">Email</td><td style="padding:5px 0;font-size:13px;"><a href="mailto:${escapeHtml(candidate.email)}" style="color:#2563eb;text-decoration:none;">${escapeHtml(candidate.email)}</a></td></tr>` : ""}
+          ${job?.title ? `<tr><td style="padding:5px 0;color:#64748b;font-size:13px;font-weight:500;">Position</td><td style="padding:5px 0;color:#0f172a;font-size:13px;font-weight:600;">${escapeHtml(job.title)}</td></tr>` : ""}
+        </table>
+        <div style="margin-top:16px;">
+          <a href="${dashboardUrl}" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-size:13px;font-weight:600;padding:10px 20px;border-radius:7px;">View in Pipeline →</a>
+        </div>
+      </div>
+    ` : "";
+
+    const bodyHtml = `<p style="margin:0 0 4px;font-size:15px;color:#374151;line-height:1.75;">${message.replace(/\n/g, "<br>")}</p>${candidateCard}`;
+    const html = `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;">
+        <div style="background:#0f172a;padding:22px 32px;">
+          <span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:-.3px;">${escapeHtml(org?.company_name ?? "HireFlow")}</span>
+        </div>
+        <div style="padding:32px;">${bodyHtml}</div>
+      </div>
+    `;
+    const subject = `${org?.company_name ?? "HireFlow"}: ${message.replace(/<[^>]*>/g, "").slice(0, 80)}`;
+
+    // Collect all owner/admin/recruiter user IDs
+    const { data: members } = await sb
+      .from("user_roles")
+      .select("user_id")
+      .eq("organization_id", ctx.organizationId)
+      .in("role", ["owner", "admin", "recruiter"]);
+
+    const uniqueIds = [...new Set((members ?? []).map(m => m.user_id))];
+    if (!uniqueIds.length) {
+      console.warn("[automations] notify_team: no org members found");
+      return;
+    }
+
+    // Resolve auth emails for each member
+    const emailResults = await Promise.all(uniqueIds.map(uid => sb.auth.admin.getUserById(uid)));
+    const emails = emailResults.map(r => r.data.user?.email).filter(Boolean) as string[];
+
+    if (!emails.length) {
+      console.warn("[automations] notify_team: could not resolve any member emails");
+      return;
+    }
+
+    console.log(`[automations] notifying ${emails.length} team member(s):`, emails);
+    await Promise.allSettled(emails.map(email => sendSystemEmail(email, subject, html)));
   }
 
   for (const auto of automations) {
     const ac = (auto.action_config ?? {}) as ActionConfig;
     const tc = (auto.trigger_config ?? {}) as { stage_filter?: string };
 
+    // Stage filter check
     if (trigger === "stage_changed" && tc.stage_filter && tc.stage_filter !== ctx.stage) continue;
+
+    // Delay scheduling is not yet implemented — log and execute immediately
+    if ((ac.delay_minutes ?? 0) > 0) {
+      console.warn(`[automations] "${auto.name}" has delay_minutes=${ac.delay_minutes} — scheduled delays not yet implemented, executing immediately`);
+    }
 
     console.log(`[automations] executing "${auto.name}" → action=${auto.action}`);
 
@@ -159,19 +217,21 @@ export async function runAutomations(trigger: string, ctx: AutomationContext) {
           break;
         }
         case "send_offer_letter": {
-          // Notify the recruiter (job provider) that an offer letter is ready — the formal
-          // letter is sent to the candidate separately from the Offer Letters page.
+          // Notify the recruiter that an offer letter is ready — the formal letter
+          // is sent to the candidate separately from the Offer Letters page.
           const message = substitute(
-            `An offer letter has been prepared for <strong>{{candidate_name}}</strong> for the <strong>{{job_title}}</strong> position. Please review and send it from the Offer Letters section.`,
+            `An offer letter is ready for <strong>{{candidate_name}}</strong> for the <strong>{{job_title}}</strong> position. Please review and send it from the Offer Letters section.`,
             vars,
           );
           await notifyTeam(message);
           break;
         }
+        default:
+          console.warn(`[automations] unknown action "${auto.action}" — skipping`);
       }
       console.log(`[automations] "${auto.name}" completed`);
     } catch (e) {
-      console.error(`[automations] "${auto.name}" failed:`, e);
+      console.error(`[automations] "${auto.name}" failed:`, e instanceof Error ? e.message : e);
     }
   }
 }
